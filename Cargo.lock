@@ -149,7 +149,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "multiline-term-input"
+name = "multiline-terminal-input"
 version = "0.1.0"
 dependencies = [
  "crossterm",

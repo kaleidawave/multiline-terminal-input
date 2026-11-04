@@ -1,4 +1,4 @@
-use multiline_term_input::{read_to_string, Mode, Options};
+use multiline_terminal_input::{read_to_string, Mode, Options};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let options = Options {
