@@ -258,7 +258,7 @@ pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> 
 							match byte {
 								// Shift enter I think
 								b'~' => {
-									if arguments != &[27, 2, 13] {
+									if arguments != [27, 2, 13] {
 										writeln!(&mut log, "{arguments:?} != [27, 2, 13]").unwrap();
 										log.flush().unwrap();
 									}
@@ -304,7 +304,7 @@ pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> 
 										}
 										write!(&mut stdout, "{argument}")?;
 									}
-									stdout.write(&[byte])?;
+									let _ = stdout.write(&[byte])?;
 									Write::flush(&mut stdout)?;
 								}
 							}
@@ -316,8 +316,8 @@ pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> 
 							writeln!(&mut log, "x1b then {byte}", byte = byte as char).unwrap();
 							log.flush().unwrap();
 						}
-						// No idea echo it out
-						stdout.write(&[byte])?;
+						// No idea, echo it out
+						let _ = stdout.write(&[byte])?;
 					}
 				}
 			}
