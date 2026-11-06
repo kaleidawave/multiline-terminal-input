@@ -1,4 +1,5 @@
 #![doc = include_str!("README.md")]
+#![warn(clippy::pedantic)]
 
 use std::io::{Result, Write};
 
@@ -52,23 +53,59 @@ impl Buf {
 	}
 
 	// TODO what about `\r` etc..?
-	pub fn push(&mut self, c: char) {
+	pub fn push(&mut self, c: char, prefix: &str, stdout: &mut impl Write) -> Result<()> {
 		if c == '\n' {
-			self.new_line();
+			self.new_line(prefix, stdout)?;
 		} else {
 			let row = &mut self.rows[self.row];
 			if self.column > row.len() {
-				row.push(c)
+				row.push(c);
 			} else {
 				row.insert(self.column, c);
 			}
 			self.column += c.len_utf8();
+			write!(stdout, "{c}")?;
+			let to_right_of_cursor = self.to_right_of_cursor();
+			if !to_right_of_cursor.is_empty() {
+				let after = to_right_of_cursor.len();
+				// clear rest of line. append content, reset cursor
+				write!(stdout, "{to_right_of_cursor}\x1b[{after}D")?;
+			}
+			Write::flush(stdout)?;
 		}
+		Ok(())
 	}
 
+	fn new_line(&mut self, prefix: &str, stdout: &mut impl Write) -> Result<()> {
+		self.column = 0;
+		self.row += 1;
+		let at_end = self.row == self.rows.len();
+		if at_end {
+			self.rows.push(String::new());
+			// \r needed to return to start
+			write!(stdout, "\r\n{prefix}")?;
+		} else {
+			self.rows.insert(self.row, String::new());
+			write!(stdout, "\r\n{prefix}")?;
+			write!(stdout, "\x1b[s")?;
+			Write::flush(stdout)?;
+
+			// clear screen
+			write!(stdout, "\x1b[J")?;
+			for row in &self.rows[self.row..] {
+				writeln!(stdout, "{prefix}{row}")?;
+			}
+			write!(stdout, "\x1b[u")?;
+		}
+		Write::flush(stdout)?;
+		Ok(())
+	}
+
+	// TODO not pub. this should be handled
 	pub fn to_right_of_cursor(&self) -> &str {
 		&self.rows[self.row][self.column..]
 	}
+
 	pub fn move_up(&mut self, up: usize, stdout: &mut impl Write) -> Result<()> {
 		if self.row >= up {
 			self.row -= up;
@@ -128,12 +165,6 @@ impl Buf {
 		}
 	}
 
-	fn new_line(&mut self) {
-		self.column = 0;
-		self.row += 1;
-		self.rows.insert(self.row, String::new());
-	}
-
 	pub fn into_rows(self) -> Vec<String> {
 		self.rows
 	}
@@ -150,8 +181,8 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 	let mut buf: Buf = Buf::new(initial);
 
 	// For debugging
-	const LOG: bool = true;
-	let mut log = LOG.then(|| std::fs::File::create("private/log.txt").unwrap());
+	// const LOG: bool = true;
+	// let mut log = LOG.then(|| std::fs::File::create("private/log.txt").unwrap());
 
 	let mut stdout = io::stdout();
 	let stdin = io::stdin();
@@ -177,21 +208,6 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 
 	terminal::enable_raw_mode()?;
 
-	macro_rules! append_to_buf {
-		($c:expr) => {{
-			let c = $c;
-			buf.push(c);
-			write!(&mut stdout, "{c}")?;
-			let to_right_of_cursor = buf.to_right_of_cursor();
-			if !to_right_of_cursor.is_empty() {
-				let after = to_right_of_cursor.len();
-				// clear rest of line. append content, reset cursor
-				write!(&mut stdout, "{to_right_of_cursor}\x1b[{after}D")?;
-			}
-			Write::flush(&mut stdout)?;
-		}};
-	}
-
 	'main: while let Some(byte) = bytes.next() {
 		let byte = byte?;
 
@@ -204,9 +220,7 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 					break;
 				}
 
-				write!(&mut stdout, "\r\n{prefix}")?;
-				Write::flush(&mut stdout)?;
-				buf.push('\n');
+				buf.push('\n', prefix, &mut stdout)?;
 			}
 			// TODO not sure
 			b'\r' => {
@@ -216,9 +230,7 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 					break;
 				}
 
-				write!(&mut stdout, "\r\n{prefix}")?;
-				Write::flush(&mut stdout)?;
-				buf.push('\n');
+				buf.push('\n', prefix, &mut stdout)?;
 			}
 			// delete key
 			0x7f => {
@@ -240,7 +252,10 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 			}
 			// ESC
 			0x1b => {
-				let byte = bytes.next().unwrap().unwrap_or_default();
+				let Some(byte) = bytes.next() else {
+					return Err(std::io::ErrorKind::InvalidData.into());
+				};
+				let byte = byte?;
 				match byte {
 					// OSC
 					b'[' => {
@@ -261,18 +276,16 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 							match byte {
 								// Shift enter
 								b'~' => {
-									if arguments != [27, 2, 13] {
-										if let Some(ref mut log) = log {
-											writeln!(log, "{arguments:?} != [27, 2, 13]").unwrap();
-											log.flush().unwrap();
-										}
-									}
+									// if arguments != [27, 2, 13] {
+									// 	if let Some(ref mut log) = log {
+									// 		writeln!(log, "{arguments:?} != [27, 2, 13]").unwrap();
+									// 		log.flush().unwrap();
+									// 	}
+									// }
 									if return_mode == Mode::ReturnOnShiftNewLine {
 										break 'main;
 									}
-									write!(&mut stdout, "\r\n{prefix}")?;
-									Write::flush(&mut stdout)?;
-									buf.push('\n');
+									buf.push('\n', prefix, &mut stdout)?;
 								}
 								// Cursor up
 								b'A' => {
@@ -298,39 +311,43 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 									assert!(arguments.is_empty());
 									buf.move_left(arg, &mut stdout)?;
 								}
-								byte => {
-									if let Some(ref mut log) = log {
-										writeln!(
-											log,
-											"unhandled x1b [ {arguments:?} {byte}",
-											byte = byte as char
-										)
-										.unwrap();
-										log.flush().unwrap();
-									}
-									if false {
-										write!(&mut stdout, "\x1b[")?;
-										for (idx, argument) in arguments.into_iter().enumerate() {
-											if idx > 0 {
-												write!(&mut stdout, ";")?;
-											}
-											write!(&mut stdout, "{argument}")?;
-										}
-										let _ = stdout.write(&[byte])?;
-										Write::flush(&mut stdout)?;
-									}
+								_byte => {
+									// if let Some(ref mut log) = log {
+									// 	writeln!(
+									// 		log,
+									// 		"unhandled x1b [ {arguments:?} {byte}",
+									// 		byte = byte as char
+									// 	)
+									// 	.unwrap();
+									// 	log.flush().unwrap();
+									// }
+
+									// Do not print unknown sequencies
+									// if false {
+									// 	write!(&mut stdout, "\x1b[")?;
+									// 	for (idx, argument) in arguments.into_iter().enumerate() {
+									// 		if idx > 0 {
+									// 			write!(&mut stdout, ";")?;
+									// 		}
+									// 		write!(&mut stdout, "{argument}")?;
+									// 	}
+									// 	let _ = stdout.write(&[byte])?;
+									// 	Write::flush(&mut stdout)?;
+									// }
 								}
 							}
 							break;
 						}
 					}
-					byte => {
-						if let Some(ref mut log) = log {
-							writeln!(log, "x1b then {byte}", byte = byte as char).unwrap();
-							log.flush().unwrap();
-						}
+					_byte => {
+						// if let Some(ref mut log) = log {
+						// 	writeln!(log, "x1b then {byte}", byte = byte as char).unwrap();
+						// 	log.flush().unwrap();
+						// }
 						// No idea, echo it out
-						let _ = stdout.write(&[byte])?;
+						// if false {
+						// 	let _ = stdout.write(&[byte])?;
+						// }
 					}
 				}
 			}
@@ -348,29 +365,28 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 					}
 				}
 				if let Some(c) = char::from_u32(acc) {
-					write!(&mut stdout, "{c}")?;
-					Write::flush(&mut stdout)?;
-					append_to_buf!(c);
-				} else if let Some(ref mut log) = log {
-					writeln!(log, "unknown char {acc}").unwrap();
-					log.flush().unwrap();
+					buf.push(c, prefix, &mut stdout)?;
 				}
+				// else if let Some(ref mut log) = log {
+				// 	writeln!(log, "unknown char {acc}").unwrap();
+				// 	log.flush().unwrap();
+				// }
 			}
 			5 => {
-				if let Some(ref mut log) = log {
-					writeln!(log, "5").unwrap();
-					log.flush().unwrap();
-				}
+				// 	if let Some(ref mut log) = log {
+				// 		writeln!(log, "5").unwrap();
+				// 		log.flush().unwrap();
+				// 	}
 			}
 			// otherwise ascii characters
 			byte => {
 				if let Some(c) = char::from_u32(u32::from(byte)) {
-					append_to_buf!(c);
+					buf.push(c, prefix, &mut stdout)?;
 				} else {
-					if let Some(ref mut log) = log {
-						writeln!(log, "unknown char {byte}").unwrap();
-						log.flush().unwrap();
-					}
+					// if let Some(ref mut log) = log {
+					// 	writeln!(log, "unknown char {byte}").unwrap();
+					// 	log.flush().unwrap();
+					// }
 					break;
 				}
 			}
