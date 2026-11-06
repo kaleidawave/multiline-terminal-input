@@ -63,3 +63,11 @@ jobs:
           git add -u
           git commit -m "Release: ${{ steps.update-version.outputs.new-versions-description }}"
           git push origin ${{ steps.checkout.outputs.ref }}
+
+        # WIP
+      - name: Make GitHub release
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release create 'release/${{ steps.update-version.outputs.new-version }}' \
+            -t '${{ steps.update-version.outputs.new-versions-description }}' \
+            --draft

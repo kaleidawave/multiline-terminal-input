@@ -16,9 +16,5 @@ repository = "https://github.com/kaleidawave/multiline-terminal-input"
 [lib]
 path = "lib.rs"
 
-[target.'cfg(windows)'.dependencies]
-winconsole = { version = "0.11.1", features = ["input"] }
-
-[target.'cfg(not(windows))'.dependencies]
+[dependencies]
 crossterm = "0.29.0"
-

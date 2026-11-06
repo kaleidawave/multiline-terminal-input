@@ -1,5 +1,7 @@
 #![doc = include_str!("README.md")]
 
+use std::io::{Result, Write};
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub enum Mode {
 	#[default]
@@ -7,7 +9,7 @@ pub enum Mode {
 	ReturnOnShiftNewLine,
 }
 
-/// Prompt, mode and prefix for reading
+/// Options for reading input
 #[derive(Debug, Default)]
 pub struct Options<'a> {
 	/// Initial printed line (with new line);
@@ -16,10 +18,11 @@ pub struct Options<'a> {
 	pub prefix: &'a str,
 	/// What key combination to return on
 	pub return_mode: Mode,
+	/// An initial input to edit / build apon
+	pub initial: &'a str,
 }
 
-#[cfg(any(target_family = "windows", target_family = "unix"))]
-pub fn read_to_string(options: Options<'_>) -> std::io::Result<String> {
+pub fn read_to_string(options: Options<'_>) -> Result<String> {
 	use std::fmt::Write;
 
 	let rows = read_to_vec_string(options)?;
@@ -30,144 +33,144 @@ pub fn read_to_string(options: Options<'_>) -> std::io::Result<String> {
 	Ok(buf)
 }
 
-#[cfg(not(any(target_family = "windows", target_family = "unix")))]
-pub fn read_to_string(_options: Options<'_>) -> std::io::Result<String> {
-	Err(std::io::ErrorKind::Unsupported.into())
+struct Buf {
+	rows: Vec<String>,
+	row: usize,
+	column: usize,
 }
 
-/// Reads string from `stdin`. If shift is pressed while new line then keeps reading (or skips depending on `options.mode`).
-#[cfg(target_family = "windows")]
-pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> {
-	use std::io::{self, Write};
-	use winconsole::input::{is_key_down, KeyCode};
-
-	let stdin = io::stdin();
-	// TODO we could have Vec<String> here, but then we would have to account of backspace etc
-	let mut buf = String::new();
-
-	let Options { prefix, return_mode, prompt } = options;
-
-	if !prompt.is_empty() {
-		let mut stdout = io::stdout();
-		write!(&mut stdout, "{prompt}");
-		Write::flush(&mut stdout)?;
-	}
-
-	if !prefix.is_empty() {
-		let mut stdout = io::stdout();
-		write!(&mut stdout, "{prefix}")?;
-		Write::flush(&mut stdout)?;
-	}
-
-	while let Ok(count) = stdin.read_line(&mut buf) {
-		if is_key_down(KeyCode::Shift) == matches!(return_mode, Mode::ReturnOnUndecoratedNewLine) {
-			let mut stdout = io::stdout();
-			write!(&mut stdout, "{prefix}");
-			Write::flush(&mut stdout);
+impl Buf {
+	pub fn new(existing: &str) -> Buf {
+		let rows: Vec<String> = if existing.is_empty() {
+			vec![String::new()]
 		} else {
-			break;
+			existing.lines().map(str::to_owned).collect()
+		};
+		let row = rows.len() - 1;
+		let column = rows.last().unwrap().len();
+		Self { rows, row, column }
+	}
+
+	// TODO what about `\r` etc..?
+	pub fn push(&mut self, c: char) {
+		if c == '\n' {
+			self.new_line();
+		} else {
+			let row = &mut self.rows[self.row];
+			if self.column > row.len() {
+				row.push(c)
+			} else {
+				row.insert(self.column, c);
+			}
+			self.column += c.len_utf8();
 		}
 	}
 
-	Ok(buf.split().map(str::to_owned).collect())
+	pub fn to_right_of_cursor(&self) -> &str {
+		&self.rows[self.row][self.column..]
+	}
+	pub fn move_up(&mut self, up: usize, stdout: &mut impl Write) -> Result<()> {
+		if self.row >= up {
+			self.row -= up;
+			write!(stdout, "\x1b[{up}A")?;
+			if let Some(move_left) = self.column.checked_sub(self.rows[self.row].len()) {
+				self.column -= move_left;
+				write!(stdout, "\x1b[{move_left}D")?;
+			}
+			Write::flush(stdout)?;
+		}
+		Ok(())
+	}
+
+	pub fn move_down(&mut self, down: usize, stdout: &mut impl Write) -> Result<()> {
+		if self.row + down < self.rows.len() {
+			self.row += down;
+			write!(stdout, "\x1b[{down}B")?;
+			if let Some(move_left) = self.column.checked_sub(self.rows[self.row].len()) {
+				self.column -= move_left;
+				write!(stdout, "\x1b[{move_left}D")?;
+			}
+			Write::flush(stdout)?;
+		}
+		Ok(())
+	}
+
+	pub fn move_right(&mut self, right: usize, stdout: &mut impl Write) -> Result<()> {
+		let row = &self.rows[self.row];
+		if right + self.column <= row.len() {
+			self.column += right;
+			write!(stdout, "\x1b[{right}C")?;
+			Write::flush(stdout)?;
+		}
+		Ok(())
+	}
+
+	pub fn move_left(&mut self, left: usize, stdout: &mut impl Write) -> Result<()> {
+		if left <= self.column {
+			self.column -= left;
+			write!(stdout, "\x1b[{left}D")?;
+			Write::flush(stdout)?;
+		}
+		Ok(())
+	}
+
+	pub fn pop(&mut self) -> Option<char> {
+		if let Some(chr) = self.rows[self.row].pop() {
+			self.column -= chr.len_utf8();
+			Some(chr)
+		} else if self.row >= 1 {
+			let _ = self.rows.remove(self.row);
+			self.row -= 1;
+			self.column = self.rows[self.row].len();
+			Some('\n')
+		} else {
+			None
+		}
+	}
+
+	fn new_line(&mut self) {
+		self.column = 0;
+		self.row += 1;
+		self.rows.insert(self.row, String::new());
+	}
+
+	pub fn into_rows(self) -> Vec<String> {
+		self.rows
+	}
 }
 
-/// Reads string from `stdin`. If shift is pressed while new line then keeps reading (or skips depending on `options.mode`).
-#[cfg(target_family = "unix")]
-pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> {
+/// Reads string from `stdin`.
+/// If shift is pressed while new line then keeps reading (or skips depending on `options.mode`).
+pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 	use crossterm::terminal;
 	use std::io::{self, Read, Write};
 
-	let Options { prefix, return_mode, prompt } = options;
+	let Options { prefix, return_mode, prompt, initial } = options;
 
-	struct Buf {
-		rows: Vec<String>,
-		row: usize,
-		column: usize,
-	}
+	let mut buf: Buf = Buf::new(initial);
 
-	impl Default for Buf {
-		fn default() -> Self {
-			Self { rows: vec![String::new()], row: 0, column: 0 }
-		}
-	}
-
-	impl Buf {
-		// TODO what about `\r` etc..?
-		pub fn push(&mut self, c: char) {
-			if c == '\n' {
-				self.new_line();
-			} else {
-				let row = &mut self.rows[self.row];
-				if self.column > row.len() {
-					row.push(c)
-				} else {
-					row.insert(self.column, c);
-				}
-				self.column += c.len_utf8();
-			}
-		}
-
-		pub fn to_right_of_cursor(&self) -> &str {
-			&self.rows[self.row][self.column..]
-		}
-
-		pub fn move_left(&mut self, left: usize) {
-			if left > self.column {
-				self.column = 0;
-			} else {
-				self.column -= left;
-			}
-		}
-
-		pub fn move_right(&mut self, right: usize) {
-			let row = &self.rows[self.row];
-			if right + self.column > row.len() {
-				self.column = row.len();
-			} else {
-				self.column += right;
-			}
-		}
-
-		pub fn pop(&mut self) -> Option<char> {
-			if let Some(chr) = self.rows[self.row].pop() {
-				self.column -= chr.len_utf8();
-				Some(chr)
-			} else if self.row >= 1 {
-				let _ = self.rows.remove(self.row);
-				self.row -= 1;
-				self.column = self.rows[self.row].len();
-				Some('\n')
-			} else {
-				None
-			}
-		}
-
-		fn new_line(&mut self) {
-			self.column = 0;
-			self.row += 1;
-			self.rows.insert(self.row, String::new());
-		}
-
-		pub fn into_rows(self) -> Vec<String> {
-			self.rows
-		}
-	}
-
-	let mut buf: Buf = Buf::default();
-
-	let mut log = std::fs::File::create("private/log.txt").unwrap();
+	// For debugging
+	const LOG: bool = true;
+	let mut log = LOG.then(|| std::fs::File::create("private/log.txt").unwrap());
 
 	let mut stdout = io::stdout();
 	let stdin = io::stdin();
-	let mut bytes = stdin.bytes();
+	let mut bytes = std::io::BufReader::new(stdin).bytes();
 
 	if !prompt.is_empty() {
 		writeln!(&mut stdout, "{prompt}")?;
 		Write::flush(&mut stdout)?;
 	}
 
-	if !prefix.is_empty() {
+	if !initial.is_empty() {
+		for (idx, line) in initial.lines().enumerate() {
+			if idx > 0 {
+				writeln!(&mut stdout)?;
+			}
+			write!(&mut stdout, "{prefix}{line}")?;
+		}
+		Write::flush(&mut stdout)?;
+	} else if !prefix.is_empty() {
 		write!(&mut stdout, "{prefix}")?;
 		Write::flush(&mut stdout)?;
 	}
@@ -256,11 +259,13 @@ pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> 
 							}
 
 							match byte {
-								// Shift enter I think
+								// Shift enter
 								b'~' => {
 									if arguments != [27, 2, 13] {
-										writeln!(&mut log, "{arguments:?} != [27, 2, 13]").unwrap();
-										log.flush().unwrap();
+										if let Some(ref mut log) = log {
+											writeln!(log, "{arguments:?} != [27, 2, 13]").unwrap();
+											log.flush().unwrap();
+										}
 									}
 									if return_mode == Mode::ReturnOnShiftNewLine {
 										break 'main;
@@ -269,51 +274,59 @@ pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> 
 									Write::flush(&mut stdout)?;
 									buf.push('\n');
 								}
+								// Cursor up
+								b'A' => {
+									let arg = arguments.pop().unwrap_or(1);
+									assert!(arguments.is_empty());
+									buf.move_up(arg, &mut stdout)?;
+								}
+								// Cursor down
+								b'B' => {
+									let arg = arguments.pop().unwrap_or(1);
+									assert!(arguments.is_empty());
+									buf.move_down(arg, &mut stdout)?;
+								}
 								// Cursor forward
 								b'C' => {
 									let arg = arguments.pop().unwrap_or(1);
-									buf.move_right(arg);
 									assert!(arguments.is_empty());
-									// TODO if across new line
-									write!(&mut stdout, "\x1b[{arg}C")?;
-									Write::flush(&mut stdout)?;
+									buf.move_right(arg, &mut stdout)?;
 								}
 								// Cursor backwards
 								b'D' => {
 									let arg = arguments.pop().unwrap_or(1);
-									buf.move_left(arg);
 									assert!(arguments.is_empty());
-									// TODO if across new line
-									write!(&mut stdout, "\x1b[{arg}D")?;
-									Write::flush(&mut stdout)?;
+									buf.move_left(arg, &mut stdout)?;
 								}
 								byte => {
-									{
+									if let Some(ref mut log) = log {
 										writeln!(
-											&mut log,
+											log,
 											"unhandled x1b [ {arguments:?} {byte}",
 											byte = byte as char
 										)
 										.unwrap();
 										log.flush().unwrap();
 									}
-									write!(&mut stdout, "\x1b[")?;
-									for (idx, argument) in arguments.into_iter().enumerate() {
-										if idx > 0 {
-											write!(&mut stdout, ";")?;
+									if false {
+										write!(&mut stdout, "\x1b[")?;
+										for (idx, argument) in arguments.into_iter().enumerate() {
+											if idx > 0 {
+												write!(&mut stdout, ";")?;
+											}
+											write!(&mut stdout, "{argument}")?;
 										}
-										write!(&mut stdout, "{argument}")?;
+										let _ = stdout.write(&[byte])?;
+										Write::flush(&mut stdout)?;
 									}
-									let _ = stdout.write(&[byte])?;
-									Write::flush(&mut stdout)?;
 								}
 							}
 							break;
 						}
 					}
 					byte => {
-						{
-							writeln!(&mut log, "x1b then {byte}", byte = byte as char).unwrap();
+						if let Some(ref mut log) = log {
+							writeln!(log, "x1b then {byte}", byte = byte as char).unwrap();
 							log.flush().unwrap();
 						}
 						// No idea, echo it out
@@ -337,29 +350,25 @@ pub fn read_to_vec_string(options: Options<'_>) -> std::io::Result<Vec<String>> 
 				if let Some(c) = char::from_u32(acc) {
 					write!(&mut stdout, "{c}")?;
 					Write::flush(&mut stdout)?;
-					// TODO make sure not new line etc
 					append_to_buf!(c);
-				} else {
-					writeln!(&mut log, "unknown char {acc}").unwrap();
+				} else if let Some(ref mut log) = log {
+					writeln!(log, "unknown char {acc}").unwrap();
 					log.flush().unwrap();
 				}
 			}
 			5 => {
-				writeln!(&mut log, "5").unwrap();
-				log.flush().unwrap();
+				if let Some(ref mut log) = log {
+					writeln!(log, "5").unwrap();
+					log.flush().unwrap();
+				}
 			}
-			// TODO what is this?
-			// 194 => {
-			// 	writeln!(&mut log, "194?").unwrap();
-			// 	log.flush().unwrap();
-			// }
 			// otherwise ascii characters
 			byte => {
 				if let Some(c) = char::from_u32(u32::from(byte)) {
 					append_to_buf!(c);
 				} else {
-					{
-						writeln!(&mut log, "unknown char {byte}").unwrap();
+					if let Some(ref mut log) = log {
+						writeln!(log, "unknown char {byte}").unwrap();
 						log.flush().unwrap();
 					}
 					break;
