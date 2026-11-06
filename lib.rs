@@ -101,8 +101,91 @@ impl Buf {
 		Ok(())
 	}
 
-	// TODO not pub. this should be handled
-	pub fn to_right_of_cursor(&self) -> &str {
+	pub fn pop(&mut self, prefix: &str, stdout: &mut impl Write) -> Result<()> {
+		if let Some(chr) = self.rows[self.row].pop() {
+			self.column -= chr.len_utf8();
+			// TODO why twice
+			write!(stdout, "\x08 \x08")?;
+
+			let to_right_of_cursor = self.to_right_of_cursor();
+			if !to_right_of_cursor.is_empty() {
+				let after = to_right_of_cursor.len();
+				// clear rest of line. append content, reset cursor
+				write!(stdout, "\x1b[K{to_right_of_cursor}\x1b[{after}D")?;
+			}
+			Write::flush(stdout)?;
+		} else if self.row >= 1 {
+			for _ in 0..prefix.len() {
+				write!(stdout, "\x08 \x08")?;
+			}
+			// Move up (and to the right)
+			{
+				write!(stdout, "\x1b[A")?;
+				let row_len = self.rows[self.row - 1].len();
+				self.column = row_len;
+				let move_right = prefix.len() + row_len;
+				write!(stdout, "\x1b[{move_right}C")?;
+				Write::flush(stdout)?;
+			}
+			let at_end = self.row == self.rows.len();
+			if at_end {
+				let _ = self.rows.pop();
+			} else {
+				let _ = self.rows.remove(self.row);
+				write!(stdout, "\x1b[s")?;
+				Write::flush(stdout)?;
+
+				// clear screen
+				write!(stdout, "\x1b[J")?;
+				for row in &self.rows[self.row..] {
+					writeln!(stdout, "{prefix}{row}")?;
+				}
+				write!(stdout, "\x1b[u")?;
+			}
+			self.row -= 1;
+		}
+		Ok(())
+	}
+
+	pub fn pop_slice(&mut self, prefix: &str, stdout: &mut impl Write) -> Result<()> {
+		/// TODO wip
+		fn is_tab_stop(chr: char) -> bool {
+			!chr.is_ascii_alphanumeric()
+		}
+
+		if self.column == 0 {
+			self.pop(prefix, stdout)
+		} else {
+			let left_of_cursor = &self.rows[self.row][..self.column];
+			let first_tab_stop = left_of_cursor.rfind(is_tab_stop).unwrap_or_default();
+			let tab_stop_size =
+				left_of_cursor[first_tab_stop..].chars().next().map_or_default(char::len_utf8);
+
+			let mut delete_until = first_tab_stop + tab_stop_size;
+			if delete_until == self.column {
+				delete_until = delete_until.saturating_sub(1);
+			}
+
+			let delete_range = delete_until..self.column;
+			self.rows[self.row].drain(delete_range.clone());
+			for _ in delete_range {
+				// TODO why twice
+				write!(stdout, "\x08 \x08")?;
+			}
+			self.column = delete_until;
+
+			let to_right_of_cursor = self.to_right_of_cursor();
+			if !to_right_of_cursor.is_empty() {
+				let after = to_right_of_cursor.len();
+				// clear rest of line. append content, reset cursor
+				write!(stdout, "\x1b[K{to_right_of_cursor}\x1b[{after}D")?;
+			}
+			Write::flush(stdout)?;
+			Ok(())
+		}
+	}
+
+	fn to_right_of_cursor(&self) -> &str {
 		&self.rows[self.row][self.column..]
 	}
 
@@ -151,22 +234,18 @@ impl Buf {
 		Ok(())
 	}
 
-	pub fn pop(&mut self) -> Option<char> {
-		if let Some(chr) = self.rows[self.row].pop() {
-			self.column -= chr.len_utf8();
-			Some(chr)
-		} else if self.row >= 1 {
-			let _ = self.rows.remove(self.row);
-			self.row -= 1;
-			self.column = self.rows[self.row].len();
-			Some('\n')
-		} else {
-			None
+	// resets cursor position to end
+	pub fn finish(self, prefix: &str, stdout: &mut impl Write) -> Result<Vec<String>> {
+		// If not on last row
+		if self.row != self.rows.len() - 1 {
+			let move_left = self.column + prefix.len();
+			// move left, clear screen, write out the rest
+			write!(stdout, "\x1b[{move_left}D\x1b[J")?;
+			for row in &self.rows[self.row..][1..] {
+				write!(stdout, "{prefix}{row}\r\n")?;
+			}
 		}
-	}
-
-	pub fn into_rows(self) -> Vec<String> {
-		self.rows
+		Ok(self.rows)
 	}
 }
 
@@ -234,21 +313,7 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 			}
 			// delete key
 			0x7f => {
-				if let Some(chr) = buf.pop() {
-					write!(&mut stdout, "\x08 \x08")?;
-					if let '\n' = chr {
-						for _ in 0..=prefix.len() {
-							write!(&mut stdout, "\x08 \x08")?;
-						}
-					}
-					let to_right_of_cursor = buf.to_right_of_cursor();
-					if !to_right_of_cursor.is_empty() {
-						let after = to_right_of_cursor.len();
-						// clear rest of line. append content, reset cursor
-						write!(&mut stdout, "\x1b[K{to_right_of_cursor}\x1b[{after}D")?;
-					}
-					Write::flush(&mut stdout)?;
-				}
+				buf.pop(prefix, &mut stdout)?;
 			}
 			// ESC
 			0x1b => {
@@ -339,6 +404,10 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 							break;
 						}
 					}
+					// opt + delete
+					0x7f => {
+						buf.pop_slice(prefix, &mut stdout)?;
+					}
 					_byte => {
 						// if let Some(ref mut log) = log {
 						// 	writeln!(log, "x1b then {byte}", byte = byte as char).unwrap();
@@ -372,11 +441,17 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 				// 	log.flush().unwrap();
 				// }
 			}
-			5 => {
-				// 	if let Some(ref mut log) = log {
-				// 		writeln!(log, "5").unwrap();
-				// 		log.flush().unwrap();
-				// 	}
+			// not sure what these do?
+			1 | 5 => {
+				// if let Some(ref mut log) = log {
+				// 	writeln!(log, "byte: {byte}").unwrap();
+				// 	log.flush().unwrap();
+				// }
+			}
+			// ctrl+c (I think)
+			3 => {
+				break;
+				// return Err();
 			}
 			// otherwise ascii characters
 			byte => {
@@ -393,7 +468,9 @@ pub fn read_to_vec_string(options: Options<'_>) -> Result<Vec<String>> {
 		}
 	}
 
+	let out = buf.finish(prefix, &mut stdout)?;
+
 	terminal::disable_raw_mode()?;
 
-	Ok(buf.into_rows())
+	Ok(out)
 }
